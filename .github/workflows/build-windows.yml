@@ -1,0 +1,54 @@
+name: Build Windows EXE
+
+# 触发方式：
+#   1) 推送形如 v1.0.0 的标签 → 自动构建并发布 Release
+#   2) 在 Actions 页面手动运行（workflow_dispatch）→ 只产出可下载的构建产物
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# 发布 Release 需要写权限（GITHUB_TOKEN 自动提供）
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      # 用内置命令生成自制 U 图标（无需先运行 GUI）
+      - name: Generate U icon
+        run: python net_probe.py genicon --out uu889.ico
+
+      # 打包为免安装、单文件、无控制台窗口、使用 U 图标的 exe
+      - name: Build single-file exe
+        run: pyinstaller --onefile --windowed --icon uu889.ico --name UU889-NetProbe net_probe.py
+
+      # 每次运行都上传构建产物（手动运行也能下载）
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UU889-NetProbe-windows-exe
+          path: dist/UU889-NetProbe.exe
+          if-no-files-found: error
+
+      # 仅当由标签触发时，创建 Release 并附上 exe
+      - name: Publish Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/UU889-NetProbe.exe
+          generate_release_notes: true

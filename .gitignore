@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# ---- Build / packaging output (PyInstaller, Nuitka, cx_Freeze) ----
+build/
+dist/
+*.spec
+*.exe
+*.bin
+*.build/
+*.dist/
+*.onefile-build/
+*.app/
+
+# ---- Local runtime data & config ----
+# These are normally written to the per-user data dir (%APPDATA%\UU889 or
+# ~/.config/UU889), but ignore them here too in case anyone runs from the repo.
+# netprobe_config.json may contain a plaintext SMTP password — never commit it.
+netprobe_config.json
+netprobe.db
+netprobe_monitor_log.csv
+netprobe_audit.log
+audit.log
+geo/
+*.mmdb
+*.mmdb.gz
+lang/*.json
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~

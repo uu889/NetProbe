@@ -209,7 +209,6 @@ By default, geolocation uses the online `ip-api.com` endpoint (free tier ~45 req
 - **Ping / Traceroute** — invokes system commands and parses their output, auto-adapting across platforms; ping RTT parsing is locale-independent (works on Chinese Windows).
 - **TCP scan** — standard `connect_ex`; `open` = handshake succeeded, `closed` = refused, `filtered` = timeout; a non-blocking `selectors` engine adds high concurrency.
 - **UDP scan** — sends **protocol probes** for DNS/NTP/SNMP/NetBIOS/RPC/IKE/IPMI/MSSQL/SSDP/SIP/mDNS, and marks `open` **only when a reply arrives**; no response is `open|filtered` (unknown, not counted as open), with an honest `open / no-response / closed` summary.
-  > ⚠️ WireGuard and other encrypted VPNs **silently drop unauthorized packets**, so no external scanner (nmap included) can confirm their port is open — that's by design, not a tool limitation.
 - **SYN half-open** — sends SYN via raw sockets and sniffs SYN-ACK/RST (needs root); validated end-to-end under Linux user+net namespaces with results matching the connect scan.
 - **Offline GeoIP** — implements the MaxMind DB binary format (search tree + data-section decoder) with the stdlib, supporting 24/28/32-bit records and the IPv4-in-IPv6 tree.
 - **Thread-safe GUI** — background threads + `queue.Queue` + `root.after` polling keep the UI responsive.
@@ -256,7 +255,7 @@ Contents include: monitoring DB `netprobe.db`, config `netprobe_config.json`, ch
 
 ## License & Credits
 
-- **License** — recommended to release under the [MIT License](https://opensource.org/license/mit) (add a `LICENSE` file at the repo root). Swap it out as you see fit.
+- **License** — released under the [MIT License](https://opensource.org/license/mit); see the [`LICENSE`](LICENSE) file at the repo root.
 - **IP geo data** — the offline database uses [DB-IP.com](https://db-ip.com)'s **IP to City Lite**, licensed under **[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)** — keep the attribution to DB-IP when distributing builds that bundle the data.
 - **Online geolocation** — provided by [ip-api.com](https://ip-api.com)'s free endpoint.
 - **Map** — the world map is built on [Leaflet](https://leafletjs.com) + [OpenStreetMap](https://www.openstreetmap.org).

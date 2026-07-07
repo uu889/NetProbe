@@ -209,7 +209,6 @@ pyinstaller --onefile --name UU889-NetProbe-cli net_probe.py
 - **Ping / Traceroute**：调用系统命令并解析输出，跨平台自动适配；Ping RTT 解析不依赖本地化词（兼容中文 Windows）。
 - **TCP 扫描**：标准 `connect_ex`，`open`=握手成功 / `closed`=被拒 / `filtered`=超时；`selectors` 非阻塞高并发引擎大幅提速。
 - **UDP 扫描**：对 DNS/NTP/SNMP/NetBIOS/RPC/IKE/IPMI/MSSQL/SSDP/SIP/mDNS 等发**协议探针**，**只有收到应答才判为 `open`**；无响应记为 `open|filtered`（未知，不计为开放），并给出 `确认开放 / 无响应 / 关闭` 的诚实统计。
-  > ⚠️ WireGuard 等加密 VPN 会**静默丢弃未授权数据包**，任何外部扫描器（含 nmap）都无法确认其端口开放——这是其设计，不是本工具缺陷。
 - **SYN 半开**：原始套接字发 SYN、嗅探 SYN-ACK/RST，需 root；已在 Linux user+net 命名空间下做过端到端验证，结果与 connect 扫描一致。
 - **离线 GeoIP**：纯标准库实现 MaxMind DB 二进制格式（搜索树 + 数据段解码器），支持 24/28/32 位记录与 IPv4-in-IPv6 树。
 - **线程安全 GUI**：后台线程 + `queue.Queue` + `root.after` 轮询，界面不卡死。
@@ -256,7 +255,7 @@ pyinstaller --onefile --name UU889-NetProbe-cli net_probe.py
 
 ## 许可证与致谢
 
-- **许可证**：建议以 [MIT License](https://opensource.org/license/mit) 发布（在仓库根目录放一个 `LICENSE` 文件即可）。你也可以按需更换。
+- **许可证**：本项目以 [MIT License](https://opensource.org/license/mit) 发布，详见仓库根目录的 [`LICENSE`](LICENSE) 文件。
 - **IP 地理数据**：离线库使用 [DB-IP.com](https://db-ip.com) 的 **IP to City Lite** 数据库，依据 **[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)** 授权——分发含该数据的构建时，请保留对 DB-IP 的署名。
 - **在线定位**：由 [ip-api.com](https://ip-api.com) 提供免费接口。
 - **地图**：世界地图基于 [Leaflet](https://leafletjs.com) + [OpenStreetMap](https://www.openstreetmap.org)。

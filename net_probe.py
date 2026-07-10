@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UU889  网络测试工具 (桌面版)
+UU889  网络工具 (桌面版)
 ================================
 零第三方依赖，仅用 Python 标准库 + Tkinter。
 
@@ -52,6 +52,7 @@ import secrets
 import string
 import math
 import zlib
+import hashlib
 import urllib.error
 import urllib.parse
 
@@ -1978,7 +1979,7 @@ def open_bcast_sockets():
 
 def run_cli(argv):
     """命令行模式，便于脚本/流水线集成。子命令: ping/scan/trace/dns/http/tls/quality。"""
-    p = argparse.ArgumentParser(prog='net_probe', description='UU889 网络测试工具（命令行模式）')
+    p = argparse.ArgumentParser(prog='net_probe', description='UU889 网络工具（命令行模式）')
     sub = p.add_subparsers(dest='cmd')
     a = sub.add_parser('ping', help='IP段存活扫描')
     a.add_argument('target'); a.add_argument('--timeout', type=int, default=1000)
@@ -2218,12 +2219,696 @@ def run_cli(argv):
 # ================================================================== #
 #  界面层
 # ================================================================== #
+# ===================== 网络诊断增强 + 加解密编码 + 生活工具 引擎 =====================
+_DNS_TYPES = {'A': 1, 'NS': 2, 'CNAME': 5, 'SOA': 6, 'PTR': 12, 'MX': 15, 'TXT': 16, 'AAAA': 28}
+_DNS_SERVERS = ['223.5.5.5', '119.29.29.29', '8.8.8.8', '1.1.1.1']
+
+
+def _dns_encode_name(name):
+    out = b''
+    for part in name.rstrip('.').split('.'):
+        if not part:
+            continue
+        try:
+            b = part.encode('idna')
+        except Exception:
+            b = part.encode('ascii', 'ignore')
+        out += bytes([len(b)]) + b
+    return out + b'\x00'
+
+
+def _dns_read_name(data, off):
+    labels = []
+    jumped = False
+    start = off
+    end = off
+    hops = 0
+    while True:
+        if off >= len(data):
+            break
+        ln = data[off]
+        if ln & 0xC0 == 0xC0:
+            ptr = struct.unpack('>H', data[off:off + 2])[0] & 0x3FFF
+            if not jumped:
+                end = off + 2
+            off = ptr
+            jumped = True
+            hops += 1
+            if hops > 20:
+                break
+            continue
+        off += 1
+        if ln == 0:
+            break
+        labels.append(data[off:off + ln].decode('ascii', 'replace'))
+        off += ln
+    if not jumped:
+        end = off
+    return '.'.join(labels), end
+
+
+def _dns_ask(name, qtype, server, timeout=4):
+    tid = random.randint(0, 65535)
+    header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
+    q = _dns_encode_name(name) + struct.pack('>HH', _DNS_TYPES[qtype], 1)
+    pkt = header + q
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(pkt, (server, 53))
+        data, _ = s.recvfrom(4096)
+    finally:
+        s.close()
+    return data
+
+
+def _dns_parse(data, want):
+    qd = struct.unpack('>H', data[4:6])[0]
+    an = struct.unpack('>H', data[6:8])[0]
+    off = 12
+    for _ in range(qd):
+        _, off = _dns_read_name(data, off)
+        off += 4
+    recs = []
+    for _ in range(an):
+        _, off = _dns_read_name(data, off)
+        rtype, rclass, ttl, rdlen = struct.unpack('>HHIH', data[off:off + 10])
+        off += 10
+        rdata = data[off:off + rdlen]
+        if rtype == _DNS_TYPES['A'] and rdlen == 4:
+            recs.append(('A', socket.inet_ntoa(rdata)))
+        elif rtype == _DNS_TYPES['AAAA'] and rdlen == 16:
+            recs.append(('AAAA', socket.inet_ntop(socket.AF_INET6, rdata)))
+        elif rtype in (_DNS_TYPES['CNAME'], _DNS_TYPES['NS'], _DNS_TYPES['PTR']):
+            nm, _ = _dns_read_name(data, off)
+            recs.append((({5: 'CNAME', 2: 'NS', 12: 'PTR'})[rtype], nm))
+        elif rtype == _DNS_TYPES['MX']:
+            pref = struct.unpack('>H', rdata[:2])[0]
+            nm, _ = _dns_read_name(data, off + 2)
+            recs.append(('MX', '%d %s' % (pref, nm)))
+        elif rtype == _DNS_TYPES['TXT']:
+            i = 0
+            parts = []
+            while i < len(rdata):
+                l = rdata[i]
+                parts.append(rdata[i + 1:i + 1 + l].decode('utf-8', 'replace'))
+                i += 1 + l
+            recs.append(('TXT', ''.join(parts)))
+        elif rtype == _DNS_TYPES['SOA']:
+            mname, p = _dns_read_name(data, off)
+            recs.append(('SOA', mname))
+        off += rdlen
+    return [r for r in recs if r[0] == want] if want else recs
+
+
+def dns_query(name, qtypes=None, timeout=4):
+    if qtypes is None:
+        qtypes = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT']
+    try:
+        nm = name.strip().encode('idna').decode('ascii')
+    except Exception:
+        nm = name.strip()
+    out = {'name': name, 'records': {}, 'error': ''}
+    ok_any = False
+    for qt in qtypes:
+        got = []
+        for srv in _DNS_SERVERS:
+            try:
+                got = _dns_parse(_dns_ask(nm, qt, srv, timeout), qt)
+                ok_any = True
+                break
+            except Exception:
+                continue
+        out['records'][qt] = got
+    if not ok_any:
+        out['error'] = '所有 DNS 服务器均无响应（可能无网络）'
+    return out
+
+
+_WHOIS_IANA = 'whois.iana.org'
+
+
+def _whois_ask(server, query, timeout=8):
+    s = socket.create_connection((server, 43), timeout=timeout)
+    try:
+        s.sendall((query + '\r\n').encode('ascii', 'ignore'))
+        buf = b''
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > 200000:
+                break
+    finally:
+        s.close()
+    return buf.decode('utf-8', 'replace')
+
+
+def whois_query(target, timeout=8):
+    target = target.strip()
+    try:
+        ipaddress.ip_address(target)
+        q = target
+    except ValueError:
+        try:
+            q = target.encode('idna').decode('ascii')
+        except Exception:
+            q = target
+    try:
+        first = _whois_ask(_WHOIS_IANA, q, timeout)
+    except Exception as e:
+        return {'target': target, 'server': _WHOIS_IANA, 'text': '', 'error': '连接 whois.iana.org 失败: %s' % e}
+    refer = ''
+    for line in first.splitlines():
+        low = line.strip().lower()
+        if low.startswith('refer:') or low.startswith('whois:'):
+            refer = line.split(':', 1)[1].strip()
+    if refer and refer != _WHOIS_IANA:
+        try:
+            second = _whois_ask(refer, q, timeout)
+            return {'target': target, 'server': refer, 'text': second.strip(), 'via': _WHOIS_IANA}
+        except Exception as e:
+            return {'target': target, 'server': refer, 'text': first.strip(),
+                    'error': '向 %s 查询失败: %s（下方为 IANA 概要）' % (refer, e)}
+    return {'target': target, 'server': _WHOIS_IANA, 'text': first.strip()}
+
+
+def cidr_info(text):
+    net = ipaddress.ip_network(text.strip(), strict=False)
+    total = net.num_addresses
+    v4 = net.version == 4
+    if v4 and net.prefixlen <= 30:
+        usable = total - 2
+        host_first, host_last = str(net[1]), str(net[-2])
+    else:
+        usable = total
+        host_first, host_last = str(net[0]), str(net[-1])
+    return {
+        '输入': text.strip(), '版本': 'IPv%d' % net.version, '前缀长度': '/%d' % net.prefixlen,
+        '网络地址': str(net.network_address),
+        '广播地址': str(net.broadcast_address) if v4 else '（IPv6 无广播）',
+        '子网掩码': str(net.netmask), '通配符掩码': str(net.hostmask),
+        '地址总数': str(total), '可用主机数': str(max(usable, 0)),
+        '主机范围': '%s ~ %s' % (host_first, host_last),
+        '是否私有': '是' if net.is_private else '否',
+    }
+
+
+# ---------------- 加解密 / 编码 ----------------
+_MORSE = {'A': '.-', 'B': '-...', 'C': '-.-.', 'D': '-..', 'E': '.', 'F': '..-.', 'G': '--.',
+          'H': '....', 'I': '..', 'J': '.---', 'K': '-.-', 'L': '.-..', 'M': '--', 'N': '-.',
+          'O': '---', 'P': '.--.', 'Q': '--.-', 'R': '.-.', 'S': '...', 'T': '-', 'U': '..-',
+          'V': '...-', 'W': '.--', 'X': '-..-', 'Y': '-.--', 'Z': '--..', '0': '-----',
+          '1': '.----', '2': '..---', '3': '...--', '4': '....-', '5': '.....', '6': '-....',
+          '7': '--...', '8': '---..', '9': '----.', '.': '.-.-.-', ',': '--..--', '?': '..--..'}
+_MORSE_R = {v: k for k, v in _MORSE.items()}
+
+
+def _rot13(t):
+    out = []
+    for c in t:
+        o = ord(c)
+        if 65 <= o <= 90:
+            out.append(chr((o - 65 + 13) % 26 + 65))
+        elif 97 <= o <= 122:
+            out.append(chr((o - 97 + 13) % 26 + 97))
+        else:
+            out.append(c)
+    return ''.join(out)
+
+
+def codec_run(tool, text, mode='enc'):
+    t = text
+    if tool == 'base64':
+        return base64.b64encode(t.encode('utf-8')).decode() if mode == 'enc' else base64.b64decode(t.strip() + '=' * (-len(t.strip()) % 4)).decode('utf-8', 'replace')
+    if tool == 'base64url':
+        return base64.urlsafe_b64encode(t.encode('utf-8')).decode() if mode == 'enc' else base64.urlsafe_b64decode(t.strip() + '=' * (-len(t.strip()) % 4)).decode('utf-8', 'replace')
+    if tool == 'url':
+        return urllib.parse.quote(t, safe='') if mode == 'enc' else urllib.parse.unquote(t)
+    if tool == 'hex':
+        return t.encode('utf-8').hex() if mode == 'enc' else bytes.fromhex(''.join(t.split())).decode('utf-8', 'replace')
+    if tool == 'html':
+        return html.escape(t) if mode == 'enc' else html.unescape(t)
+    if tool == 'unicode':
+        return t.encode('unicode_escape').decode('latin-1') if mode == 'enc' else t.encode('latin-1', 'ignore').decode('unicode_escape')
+    if tool == 'rot13':
+        return _rot13(t)
+    if tool in ('md5', 'sha1', 'sha256', 'sha512'):
+        return hashlib.new(tool, t.encode('utf-8')).hexdigest()
+    if tool == 'json':
+        obj = json.loads(t)
+        return json.dumps(obj, ensure_ascii=False, indent=2) if mode == 'enc' else json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+    if tool == 'ts2date':
+        v = float(t.strip())
+        if v > 1e12:
+            v /= 1000.0
+        return datetime.fromtimestamp(v).strftime('%Y-%m-%d %H:%M:%S')
+    if tool == 'date2ts':
+        return str(int(datetime.strptime(t.strip(), '%Y-%m-%d %H:%M:%S').timestamp()))
+    if tool == 'morse':
+        if mode == 'enc':
+            return ' '.join(_MORSE.get(c.upper(), c) for c in t)
+        return ''.join(_MORSE_R.get(tok, ' ' if tok == '' else tok) for tok in t.split(' '))
+    return '（未知工具）'
+
+
+def base_convert(text, from_base, to_base):
+    n = int(text.strip(), from_base)
+    if to_base == 10:
+        return str(n)
+    digs = '0123456789abcdefghijklmnopqrstuvwxyz'
+    if n == 0:
+        return '0'
+    neg = n < 0
+    n = abs(n)
+    out = ''
+    while n:
+        out = digs[n % to_base] + out
+        n //= to_base
+    return ('-' if neg else '') + out
+_U_LEN = {'m': 1.0, 'km': 1000.0, 'dm': 0.1, 'cm': 0.01, 'mm': 0.001, 'um': 1e-6, 'nm': 1e-9,
+          'inch': 0.0254, 'in': 0.0254, 'ft': 0.3048, 'yd': 0.9144, 'mile': 1609.344,
+          'mil': 2.54e-5, 'hand': 0.1016, 'rod': 5.0292, 'chain': 20.1168,
+          'furlong': 201.168, 'fathom': 1.8288, 'league': 4828.032, 'nmi': 1852.0,
+          '里': 500.0, '尺': 1.0 / 3, '寸': 1.0 / 30, '海里': 1852.0}
+_U_AREA = {'m2': 1.0, 'km2': 1e6, 'cm2': 1e-4, 'mm2': 1e-6, 'ha': 1e4, '公顷': 1e4,
+           '亩': 2000.0 / 3, 'acre': 4046.856, 'ft2': 0.092903}
+_U_VOL = {'m3': 1.0, 'l': 1e-3, 'ml': 1e-6, 'cm3': 1e-6, '升': 1e-3, '毫升': 1e-6,
+          'gal': 3.785412e-3, '加仑': 3.785412e-3}
+_U_MASS = {'kg': 1.0, 'g': 1e-3, 'mg': 1e-6, 't': 1000.0, '吨': 1000.0, 'lb': 0.4535924,
+           '磅': 0.4535924, 'oz': 0.02834952, '斤': 0.5, '两': 0.05}
+_U_SPEED = {'m/s': 1.0, 'km/h': 1 / 3.6, 'mph': 0.44704, 'kn': 0.5144444, '节': 0.5144444}
+_U_TIME = {'s': 1.0, 'ms': 1e-3, 'min': 60.0, 'h': 3600.0, 'day': 86400.0, 'd': 86400.0,
+           'week': 604800.0, '周': 604800.0}
+_U_POWER = {'w': 1.0, 'kw': 1000.0, 'mw': 1e6, 'hp': 745.6999, '马力': 735.49875, 'ps': 735.49875}
+_U_PRESS = {'pa': 1.0, 'kpa': 1000.0, 'mpa': 1e6, 'bar': 1e5, 'atm': 101325.0, 'mmhg': 133.322, 'psi': 6894.757}
+_U_ENERGY = {'j': 1.0, 'kj': 1000.0, 'cal': 4.184, 'kcal': 4184.0, 'kwh': 3.6e6, 'wh': 3600.0}
+_U_DENSITY = {'kg/m3': 1.0, 'g/cm3': 1000.0, 'g/ml': 1000.0, 'kg/l': 1000.0}
+
+
+def _uconv(table, val, fu, tu, name):
+    fu = fu.strip().lower().replace('²', '2').replace('³', '3')
+    tu = tu.strip().lower().replace('²', '2').replace('³', '3')
+    tl = {k.lower(): v for k, v in table.items()}
+    if fu not in tl or tu not in tl:
+        raise ValueError('%s单位仅支持：%s' % (name, ' / '.join(table.keys())))
+    return float(val) * tl[fu] / tl[tu]
+
+
+def _u_str(table, name, vals):
+    v, fu, tu = float(vals[0]), vals[1], vals[2]
+    r = _uconv(table, v, fu, tu, name)
+    return '%g %s = %.6g %s' % (v, fu, r, tu)
+
+
+def _temp(vals):
+    v = float(vals[0]); fu = vals[1].strip().lower(); tu = vals[2].strip().lower()
+    if fu in ('c', '℃', '摄氏'): c = v
+    elif fu in ('f', '℉', '华氏'): c = (v - 32) * 5 / 9
+    elif fu in ('k', '开', '开尔文'): c = v - 273.15
+    else: raise ValueError('温度单位: c / f / k')
+    if tu in ('c', '℃', '摄氏'): r = c
+    elif tu in ('f', '℉', '华氏'): r = c * 9 / 5 + 32
+    elif tu in ('k', '开', '开尔文'): r = c + 273.15
+    else: raise ValueError('温度单位: c / f / k')
+    return '%g %s = %.4g %s' % (v, fu, r, tu)
+
+
+def _geo(shape, vals):
+    import math
+    f = [float(x) for x in vals]
+    if shape == 'cube':
+        a = f[0]; return '体积=%.6g，表面积=%.6g' % (a**3, 6 * a * a)
+    if shape == 'cuboid':
+        a, b, c = f; return '体积=%.6g，表面积=%.6g' % (a * b * c, 2 * (a * b + b * c + a * c))
+    if shape == 'sphere':
+        r = f[0]; return '体积=%.6g，表面积=%.6g' % (4 / 3 * math.pi * r**3, 4 * math.pi * r * r)
+    if shape == 'cylinder':
+        r, h = f; return '体积=%.6g，表面积=%.6g' % (math.pi * r * r * h, 2 * math.pi * r * (r + h))
+    if shape == 'cone':
+        r, h = f; l = math.hypot(r, h); return '体积=%.6g，表面积=%.6g（母线=%.4g）' % (math.pi * r * r * h / 3, math.pi * r * (r + l), l)
+    if shape == 'torus':
+        R, r = f; return '体积=%.6g，表面积=%.6g' % (2 * math.pi**2 * R * r * r, 4 * math.pi**2 * R * r)
+    if shape == 'trapezoid':
+        a, b, h = f; return '面积=%.6g' % ((a + b) * h / 2)
+    if shape == 'hexprism':
+        a, h = f; base = 3 * math.sqrt(3) / 2 * a * a; return '体积=%.6g，表面积=%.6g' % (base * h, 2 * base + 6 * a * h)
+    return '?'
+
+
+def iit_cn(vals):
+    salary = float(vals[0]); ins = float(vals[1] or 0); spec = float(vals[2] or 0)
+    taxable = salary - 5000 - ins - spec
+    if taxable <= 0:
+        return '应纳税所得额=%.2f（≤0，免税）\n税后收入≈%.2f 元' % (taxable, salary - ins)
+    brk = [(3000, 0.03, 0), (12000, 0.10, 210), (25000, 0.20, 1410), (35000, 0.25, 2660),
+           (55000, 0.30, 4410), (80000, 0.35, 7160), (float('inf'), 0.45, 15160)]
+    for cap, rate, ded in brk:
+        if taxable <= cap:
+            tax = taxable * rate - ded
+            break
+    return ('应纳税所得额=%.2f 元\n适用税率=%.0f%%，速算扣除=%.0f\n应缴个税≈%.2f 元\n税后收入≈%.2f 元\n'
+            '（按月度简易估算；实际为累计预扣，年终可能有差异）' % (taxable, rate * 100, ded, tax, salary - ins - tax))
+
+
+def loan_calc(vals):
+    P = float(vals[0]); ar = float(vals[1]) / 100; n = int(float(vals[2])); method = str(vals[3]).strip()
+    r = ar / 12
+    if '本金' in method or method == '2':
+        first_i = P * r; mp = P / n
+        total_i = P * r * (n + 1) / 2
+        return ('等额本金：每月本金=%.2f 元\n首月还款=%.2f，末月还款=%.2f\n总利息≈%.2f，总还款≈%.2f 元'
+                % (mp, mp + first_i, mp + P / n * 0 + (P - mp * (n - 1)) * r + mp, total_i, P + total_i))
+    if r == 0:
+        m = P / n
+    else:
+        m = P * r * (1 + r) ** n / ((1 + r) ** n - 1)
+    total = m * n
+    return ('等额本息：每月还款=%.2f 元\n总还款=%.2f，总利息=%.2f 元' % (m, total, total - P))
+
+
+def deposit_calc(vals):
+    P = float(vals[0]); ar = float(vals[1]) / 100; y = float(vals[2]); typ = str(vals[3]).strip()
+    if '复' in typ or typ == '2':
+        amt = P * (1 + ar) ** y
+    else:
+        amt = P * (1 + ar * y)
+    return '到期本息=%.2f 元，利息=%.2f 元' % (amt, amt - P)
+
+
+def rate_convert(vals):
+    r = float(vals[0]); ppy = {'年': 1.0, '月': 12.0, '日': 365.0}
+    fu = vals[1].strip(); tu = vals[2].strip()
+    if fu not in ppy or tu not in ppy:
+        raise ValueError('周期只能是 年/月/日')
+    r2 = r * ppy[fu] / ppy[tu]
+    return '%g%% (每%s) = %.6g%% (每%s)' % (r, fu, r2, tu)
+
+
+def date_diff(vals):
+    from datetime import datetime as _dt
+    d1 = _dt.strptime(vals[0].strip(), '%Y-%m-%d'); d2 = _dt.strptime(vals[1].strip(), '%Y-%m-%d')
+    return '相差 %d 天' % abs((d2 - d1).days)
+
+
+def date_add(vals):
+    from datetime import datetime as _dt, timedelta
+    d = _dt.strptime(vals[0].strip(), '%Y-%m-%d'); n = int(float(vals[1]))
+    r = d + timedelta(days=n)
+    wk = '一二三四五六日'[r.weekday()]
+    return '%s（星期%s）' % (r.strftime('%Y-%m-%d'), wk)
+
+
+def rmb_capital(vals):
+    amount = round(float(vals[0]) + 1e-9, 2)
+    nums = '零壹贰叁肆伍陆柒捌玖'; units = ['', '拾', '佰', '仟']; big = ['', '万', '亿', '兆']
+    neg = amount < 0; amount = abs(amount)
+    intpart = int(amount); dec = int(round((amount - intpart) * 100)); jiao = dec // 10; fen = dec % 10
+
+    def sec(n):
+        res = ''; zero = False
+        digs = []
+        while n > 0:
+            digs.append(n % 10); n //= 10
+        for i in range(len(digs) - 1, -1, -1):
+            d = digs[i]
+            if d == 0:
+                zero = True
+            else:
+                if zero and res:
+                    res += '零'
+                zero = False
+                res += nums[d] + units[i]
+        return res
+    s = ''
+    if intpart > 0:
+        segs = []; tmp = intpart
+        while tmp > 0:
+            segs.append(tmp % 10000); tmp //= 10000
+        gap = False
+        for i in range(len(segs) - 1, -1, -1):
+            seg = segs[i]
+            if seg == 0:
+                if s:
+                    gap = True
+                continue
+            if s and not s.endswith('零') and (gap or seg < 1000):
+                s += '零'
+            s += sec(seg) + big[i]
+            gap = False
+        s += '元'
+    if jiao == 0 and fen == 0:
+        s = (s or '零元') + '整'
+    else:
+        if jiao > 0:
+            s += nums[jiao] + '角'
+        elif intpart > 0 and fen > 0:
+            s += '零'
+        if fen > 0:
+            s += nums[fen] + '分'
+    return ('负' + s) if neg else s
+
+
+def date_capital(vals):
+    s = vals[0].strip().replace('/', '-')
+    zh = '〇一二三四五六七八九'
+    from datetime import datetime as _dt
+    d = _dt.strptime(s, '%Y-%m-%d')
+    y = ''.join(zh[int(c)] for c in '%04d' % d.year)
+    mo = {1: '一', 2: '二', 3: '三', 4: '四', 5: '五', 6: '六', 7: '七', 8: '八', 9: '九', 10: '十', 11: '十一', 12: '十二'}[d.month]
+    dd = d.day
+    day = ('十' if dd == 10 else (zh[dd] if dd < 10 else ('十' + zh[dd - 10] if dd < 20 else (zh[dd // 10] + '十' + (zh[dd % 10] if dd % 10 else '')))))
+    return '%s年%s月%s日' % (y, mo, day)
+
+
+def zodiac_sign(vals):
+    m = int(float(vals[0])); day = int(float(vals[1]))
+    cut = {1: (20, '水瓶座', '摩羯座'), 2: (19, '双鱼座', '水瓶座'), 3: (21, '白羊座', '双鱼座'),
+           4: (20, '金牛座', '白羊座'), 5: (21, '双子座', '金牛座'), 6: (22, '巨蟹座', '双子座'),
+           7: (23, '狮子座', '巨蟹座'), 8: (23, '处女座', '狮子座'), 9: (23, '天秤座', '处女座'),
+           10: (24, '天蝎座', '天秤座'), 11: (23, '射手座', '天蝎座'), 12: (22, '摩羯座', '射手座')}
+    c, after, before = cut[m]
+    return after if day >= c else before
+
+
+def chinese_zodiac(vals):
+    y = int(float(vals[0]))
+    a = ['鼠', '牛', '虎', '兔', '龙', '蛇', '马', '羊', '猴', '鸡', '狗', '猪']
+    return a[(y - 4) % 12] + '年'
+
+
+_BLOOD = {'A': ['A', 'O'], 'B': ['B', 'O'], 'O': ['O'], 'AB': ['A', 'B']}
+
+
+def blood_inherit(vals):
+    f = vals[0].strip().upper(); m = vals[1].strip().upper()
+    if f not in _BLOOD or m not in _BLOOD:
+        raise ValueError('血型只能是 A / B / O / AB')
+
+    def ph(x, y):
+        s = {x, y}
+        if s == {'O'}: return 'O'
+        if 'A' in s and 'B' in s: return 'AB'
+        return 'A' if 'A' in s else 'B'
+    poss = sorted({ph(a, b) for a in _BLOOD[f] for b in _BLOOD[m]})
+    imp = sorted(set(['A', 'B', 'O', 'AB']) - set(poss))
+    return '孩子可能血型：%s\n不可能：%s' % ('、'.join(poss), '、'.join(imp) or '无')
+
+
+_PAPER = {'A0': '841×1189', 'A1': '594×841', 'A2': '420×594', 'A3': '297×420', 'A4': '210×297',
+          'A5': '148×210', 'A6': '105×148', 'A7': '74×105', 'A8': '52×74',
+          'B0': '1000×1414', 'B1': '707×1000', 'B2': '500×707', 'B3': '353×500', 'B4': '250×353',
+          'B5': '176×250', 'B6': '125×176'}
+
+
+def paper_size(vals):
+    k = vals[0].strip().upper()
+    if k not in _PAPER:
+        raise ValueError('支持：%s' % ' '.join(_PAPER.keys()))
+    return '%s = %s mm' % (k, _PAPER[k])
+
+
+_TZ = {'北京': 8, '上海': 8, '香港': 8, '台北': 8, '东京': 9, '首尔': 9, '新加坡': 8, '曼谷': 7,
+       '新德里': 5.5, '迪拜': 4, '莫斯科': 3, '柏林': 1, '巴黎': 1, '伦敦': 0, '纽约': -5,
+       '芝加哥': -6, '洛杉矶': -8, '悉尼': 11}
+
+
+def world_time(vals):
+    from datetime import datetime as _dt, timedelta
+    c = vals[0].strip()
+    if c not in _TZ:
+        raise ValueError('支持城市：%s' % ' '.join(_TZ.keys()))
+    t = _dt.utcnow() + timedelta(hours=_TZ[c])
+    return '%s 当前时间：%s (UTC%+g，未计夏令时)' % (c, t.strftime('%Y-%m-%d %H:%M:%S'), _TZ[c])
+
+
+def case_convert(vals):
+    t = vals[0]; m = str(vals[1]).strip()
+    if m in ('1', '大写', 'upper'): return t.upper()
+    if m in ('2', '小写', 'lower'): return t.lower()
+    if m in ('3', '首字母', 'title'): return t.title()
+    if m in ('4', '切换', 'swap'): return t.swapcase()
+    return t.upper()
+
+
+# ---------------- 工具注册表（UI 遍历用） ----------------
+CODEC_TOOLS = [
+    ('Base64 编解码', 'base64', True), ('Base64URL', 'base64url', True),
+    ('URL 编解码', 'url', True), ('Hex 十六进制', 'hex', True),
+    ('HTML 实体', 'html', True), ('Unicode 转义', 'unicode', True),
+    ('JSON 格式化/压缩', 'json', True), ('摩尔斯电码', 'morse', True),
+    ('ROT13', 'rot13', False), ('MD5', 'md5', False), ('SHA1', 'sha1', False),
+    ('SHA256', 'sha256', False), ('SHA512', 'sha512', False),
+    ('时间戳→日期', 'ts2date', False), ('日期→时间戳', 'date2ts', False),
+]
+
+_KIN_ALIAS = {
+    '爸': '父', '爸爸': '父', '父亲': '父', '老爸': '父', '爹': '父', '父': '父',
+    '妈': '母', '妈妈': '母', '母亲': '母', '老妈': '母', '娘': '母', '母': '母',
+    '老公': '夫', '丈夫': '夫', '先生': '夫', '夫': '夫',
+    '老婆': '妻', '妻子': '妻', '太太': '妻', '妻': '妻',
+    '儿子': '子', '儿': '子', '子': '子',
+    '女儿': '女', '闺女': '女', '女': '女',
+    '哥哥': '兄', '哥': '兄', '大哥': '兄', '兄': '兄', '兄长': '兄',
+    '弟弟': '弟', '弟': '弟', '小弟': '弟',
+    '姐姐': '姐', '姐': '姐', '姊': '姐',
+    '妹妹': '妹', '妹': '妹',
+}
+_KIN_EXPAND = {
+    '爷爷': ['父', '父'], '爷': ['父', '父'], '祖父': ['父', '父'],
+    '奶奶': ['父', '母'], '祖母': ['父', '母'],
+    '外公': ['母', '父'], '姥爷': ['母', '父'], '外祖父': ['母', '父'],
+    '外婆': ['母', '母'], '姥姥': ['母', '母'], '外祖母': ['母', '母'],
+    '伯伯': ['父', '兄'], '伯父': ['父', '兄'], '大伯': ['父', '兄'],
+    '叔叔': ['父', '弟'], '叔父': ['父', '弟'], '叔': ['父', '弟'],
+    '姑姑': ['父', '姐'], '姑妈': ['父', '姐'], '姑': ['父', '姐'],
+    '舅舅': ['母', '兄'], '舅父': ['母', '兄'], '舅': ['母', '兄'],
+    '姨妈': ['母', '姐'], '阿姨': ['母', '姐'], '姨': ['母', '姐'], '姨母': ['母', '姐'],
+    '孙子': ['子', '子'], '孙女': ['子', '女'], '外孙': ['女', '子'], '外孙女': ['女', '女'],
+    '侄子': ['兄', '子'], '侄女': ['兄', '女'], '外甥': ['姐', '子'], '外甥女': ['姐', '女'],
+    '嫂子': ['兄', '妻'], '嫂嫂': ['兄', '妻'], '弟媳': ['弟', '妻'], '弟妹': ['弟', '妻'],
+    '姐夫': ['姐', '夫'], '妹夫': ['妹', '夫'],
+    '岳父': ['妻', '父'], '岳母': ['妻', '母'], '公公': ['夫', '父'], '婆婆': ['夫', '母'],
+    '女婿': ['女', '夫'], '儿媳': ['子', '妻'], '媳妇': ['子', '妻'],
+}
+_KIN_MAP = {
+    '父': '爸爸', '母': '妈妈', '夫': '丈夫', '妻': '妻子', '子': '儿子', '女': '女儿',
+    '兄': '哥哥', '弟': '弟弟', '姐': '姐姐', '妹': '妹妹',
+    '父父': '爷爷', '父母': '奶奶', '母父': '外公(姥爷)', '母母': '外婆(姥姥)',
+    '父父父': '曾祖父', '父父母': '曾祖母', '母母母': '外曾祖母', '母母父': '外曾祖父',
+    '子': '儿子', '子子': '孙子', '子女': '孙女', '女子': '外孙', '女女': '外孙女',
+    '子子子': '曾孙', '子子女': '曾孙女',
+    '父兄': '伯父(伯伯)', '父弟': '叔叔', '父姐': '姑姑', '父妹': '姑姑',
+    '母兄': '舅舅', '母弟': '舅舅', '母姐': '姨妈', '母妹': '姨妈',
+    '父兄妻': '伯母', '父弟妻': '婶婶', '父姐夫': '姑父', '父妹夫': '姑父',
+    '母兄妻': '舅妈', '母弟妻': '舅妈', '母姐夫': '姨父', '母妹夫': '姨父',
+    '兄子': '侄子', '弟子': '侄子', '兄女': '侄女', '弟女': '侄女',
+    '姐子': '外甥', '妹子': '外甥', '姐女': '外甥女', '妹女': '外甥女',
+    '父兄子': '堂兄弟', '父弟子': '堂兄弟', '父兄女': '堂姐妹', '父弟女': '堂姐妹',
+    '父姐子': '表兄弟', '父姐女': '表姐妹', '父妹子': '表兄弟', '父妹女': '表姐妹',
+    '母兄子': '表兄弟', '母兄女': '表姐妹', '母弟子': '表兄弟', '母弟女': '表姐妹',
+    '母姐子': '表兄弟', '母姐女': '表姐妹', '母妹子': '表兄弟', '母妹女': '表姐妹',
+    '妻父': '岳父', '妻母': '岳母', '夫父': '公公', '夫母': '婆婆',
+    '女夫': '女婿', '子妻': '儿媳', '兄妻': '嫂子', '弟妻': '弟媳(弟妹)', '姐夫': '姐夫', '妹夫': '妹夫',
+    '夫兄': '大伯子', '夫弟': '小叔子', '夫姐': '大姑子', '夫妹': '小姑子',
+    '妻兄': '大舅子', '妻弟': '小舅子', '妻姐': '大姨子', '妻妹': '小姨子',
+    '兄子妻': '侄媳', '子子妻': '孙媳', '女夫父': '亲家公', '子妻父': '亲家公',
+}
+
+
+def _kin_tokenize(s):
+    s = s.strip()
+    keys = sorted(set(list(_KIN_ALIAS) + list(_KIN_EXPAND)), key=len, reverse=True)
+    out = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch in '的· ，,、和':
+            i += 1
+            continue
+        if ch in ('我', '自'):
+            i += 1
+            continue
+        matched = None
+        for k in keys:
+            if s.startswith(k, i):
+                matched = k
+                break
+        if not matched:
+            i += 1
+            continue
+        if matched in _KIN_EXPAND:
+            out.extend(_KIN_EXPAND[matched])
+        else:
+            out.append(_KIN_ALIAS[matched])
+        i += len(matched)
+    return out
+
+
+def kinship(vals):
+    s = vals[0].strip()
+    prim = _kin_tokenize(s)
+    if not prim:
+        raise ValueError('请输入关系链，如：爸爸的哥哥的儿子')
+    key = ''.join(prim)
+    if key in _KIN_MAP:
+        return '%s → 【%s】' % (s, _KIN_MAP[key])
+    if all(x in ('父', '母') for x in prim):
+        n = len(prim); side = '外' if prim[0] == '母' else ''
+        g = '祖父' if prim[-1] == '父' else '祖母'
+        pre = {3: '曾', 4: '高', 5: '天', 6: '烈', 7: '太', 8: '远', 9: '鼻'}.get(n, '第%d代' % n)
+        return '%s → 【%s%s%s】(第%d代直系长辈)' % (s, side, pre, g, n)
+    if all(x in ('子', '女') for x in prim):
+        n = len(prim); g = '孙' if prim[-1] == '子' else '孙女'
+        pre = {3: '曾', 4: '玄', 5: '来', 6: '晜', 7: '仍', 8: '云', 9: '耳'}.get(n, '第%d代' % n)
+        return '%s → 【%s%s】(第%d代直系晚辈)' % (s, pre, g, n)
+    return '%s → （旁系较复杂，暂无法精确命名，可尝试更常见的关系）' % s
+
+LIFE_TOOLS = [
+    {'name': '长度换算(公制/英制)', 'fields': [('数值', '1'), ('从单位 公制:m/km/cm/mm 英制:inch/ft/yd/mile', 'inch'), ('到单位', 'cm')], 'run': lambda v: _u_str(_U_LEN, '长度', v)},
+    {'name': '面积换算', 'fields': [('数值', '1'), ('从单位', '亩'), ('到单位', 'm2')], 'run': lambda v: _u_str(_U_AREA, '面积', v)},
+    {'name': '体积/容积换算', 'fields': [('数值', '1'), ('从单位', 'l'), ('到单位', 'ml')], 'run': lambda v: _u_str(_U_VOL, '体积', v)},
+    {'name': '质量/重量换算', 'fields': [('数值', '1'), ('从单位', 'kg'), ('到单位', '斤')], 'run': lambda v: _u_str(_U_MASS, '质量', v)},
+    {'name': '温度换算', 'fields': [('数值', '100'), ('从(c/f/k)', 'c'), ('到(c/f/k)', 'f')], 'run': _temp},
+    {'name': '速度换算', 'fields': [('数值', '100'), ('从单位', 'km/h'), ('到单位', 'm/s')], 'run': lambda v: _u_str(_U_SPEED, '速度', v)},
+    {'name': '时间换算', 'fields': [('数值', '1'), ('从单位', 'h'), ('到单位', 's')], 'run': lambda v: _u_str(_U_TIME, '时间', v)},
+    {'name': '功率换算', 'fields': [('数值', '1'), ('从单位', 'hp'), ('到单位', 'w')], 'run': lambda v: _u_str(_U_POWER, '功率', v)},
+    {'name': '压力换算', 'fields': [('数值', '1'), ('从单位', 'atm'), ('到单位', 'kpa')], 'run': lambda v: _u_str(_U_PRESS, '压力', v)},
+    {'name': '热量/能量换算', 'fields': [('数值', '1'), ('从单位', 'kcal'), ('到单位', 'kj')], 'run': lambda v: _u_str(_U_ENERGY, '能量', v)},
+    {'name': '密度换算', 'fields': [('数值', '1'), ('从单位', 'g/cm3'), ('到单位', 'kg/m3')], 'run': lambda v: _u_str(_U_DENSITY, '密度', v)},
+    {'name': '正方体', 'fields': [('边长 a', '2')], 'run': lambda v: _geo('cube', v)},
+    {'name': '长方体', 'fields': [('长', '2'), ('宽', '3'), ('高', '4')], 'run': lambda v: _geo('cuboid', v)},
+    {'name': '球体', 'fields': [('半径 r', '5')], 'run': lambda v: _geo('sphere', v)},
+    {'name': '圆柱体', 'fields': [('半径 r', '3'), ('高 h', '10')], 'run': lambda v: _geo('cylinder', v)},
+    {'name': '圆锥体', 'fields': [('半径 r', '3'), ('高 h', '10')], 'run': lambda v: _geo('cone', v)},
+    {'name': '圆环体', 'fields': [('大半径 R', '5'), ('小半径 r', '2')], 'run': lambda v: _geo('torus', v)},
+    {'name': '梯形(面积)', 'fields': [('上底 a', '2'), ('下底 b', '4'), ('高 h', '3')], 'run': lambda v: _geo('trapezoid', v)},
+    {'name': '正六棱柱', 'fields': [('边长 a', '2'), ('高 h', '5')], 'run': lambda v: _geo('hexprism', v)},
+    {'name': '个人所得税(月估算)', 'fields': [('税前工资', '20000'), ('五险一金', '0'), ('专项附加扣除', '0')], 'run': iit_cn},
+    {'name': '贷款计算器', 'fields': [('贷款本金(元)', '1000000'), ('年利率(%)', '4.9'), ('期数(月)', '360'), ('方式(等额本息/等额本金)', '等额本息')], 'run': loan_calc},
+    {'name': '存款利息', 'fields': [('本金(元)', '10000'), ('年利率(%)', '2'), ('存期(年)', '3'), ('类型(单利/复利)', '复利')], 'run': deposit_calc},
+    {'name': '利率换算', 'fields': [('利率值(%)', '0.5'), ('从(年/月/日)', '月'), ('到(年/月/日)', '年')], 'run': rate_convert},
+    {'name': '日期间隔', 'fields': [('日期1(YYYY-MM-DD)', '2024-01-01'), ('日期2', '2024-12-31')], 'run': date_diff},
+    {'name': '日期推算', 'fields': [('起始日期', '2024-01-01'), ('加减天数', '100')], 'run': date_add},
+    {'name': '世界时间', 'fields': [('城市', '东京')], 'run': world_time},
+    {'name': '数字→人民币大写', 'fields': [('金额', '1234.56')], 'run': rmb_capital},
+    {'name': '日期→大写', 'fields': [('日期(YYYY-MM-DD)', '2024-01-05')], 'run': date_capital},
+    {'name': '英文大小写转换', 'fields': [('文本', 'Hello World'), ('模式(大写/小写/首字母/切换)', '大写')], 'run': case_convert},
+    {'name': '星座查询', 'fields': [('月', '3'), ('日', '25')], 'run': zodiac_sign},
+    {'name': '生肖查询', 'fields': [('年份', '2020')], 'run': chinese_zodiac},
+    {'name': '血型遗传', 'fields': [('父方(A/B/O/AB)', 'A'), ('母方(A/B/O/AB)', 'B')], 'run': blood_inherit},
+    {'name': '纸张尺寸', 'fields': [('规格(A4/B5...)', 'A4')], 'run': paper_size},
+    {'name': '亲戚称谓计算', 'fields': [('关系链(如 爸爸的哥哥的儿子)', '爸爸的哥哥的儿子')], 'run': kinship},
+]
+
+
 class UU889App:
     def __init__(self, root):
         self.root = root
-        self.root.title('UU889  网络测试工具')
-        self.root.geometry('960x640')
-        self.root.minsize(820, 560)
+        self.root.title('UU889  网络工具')
+        self.root.geometry('1220x800')
+        self.root.minsize(1024, 640)
         try:
             self._icon_img = tk.PhotoImage(data=base64.b64encode(_icon_png(64)).decode('ascii'))
             self.root.iconphoto(True, self._icon_img)
@@ -2266,7 +2951,14 @@ class UU889App:
         _lcb.pack(side='left', padx=(4, 10))
         _lcb.bind('<<ComboboxSelected>>', self._on_lang_change)
         ttk.Button(top_bar, text='打开数据目录', command=self._open_data_dir).pack(side='right')
+        ttk.Label(top_bar, text='🔍 功能搜索:').pack(side='left', padx=(6, 0))
+        self._feat_cb = ttk.Combobox(top_bar, width=22)
+        self._feat_cb.pack(side='left', padx=(4, 0))
+        self._feat_cb.bind('<KeyRelease>', self._feat_filter)
+        self._feat_cb.bind('<<ComboboxSelected>>', self._feat_go)
+        self._feat_cb.bind('<Return>', self._feat_go)
         nb = ttk.Notebook(root)
+        self.nb = nb
         nb.pack(fill='both', expand=True, padx=8, pady=(8, 4))
         self.tab_ping = ttk.Frame(nb)
         self.tab_port = ttk.Frame(nb)
@@ -2275,8 +2967,8 @@ class UU889App:
         self.tab_diag = ttk.Frame(nb)
         self.tab_qmon = ttk.Frame(nb)
         self.tab_arp = ttk.Frame(nb)
-        self.tab_ipinfo = ttk.Frame(nb)
         self.tab_pass = ttk.Frame(nb)
+        self.tab_life = ttk.Frame(nb)
         nb.add(self.tab_ping, text=t('  主机存活扫描  '))
         nb.add(self.tab_port, text=t('  端口扫描  '))
         nb.add(self.tab_trace, text=t('  路由追踪 + 地理定位  '))
@@ -2284,8 +2976,8 @@ class UU889App:
         nb.add(self.tab_diag, text=t('  网络诊断  '))
         nb.add(self.tab_qmon, text=t('  链路质量曲线  '))
         nb.add(self.tab_arp, text=t('  ARP 监听  '))
-        nb.add(self.tab_ipinfo, text=t('  IP归属地  '))
-        nb.add(self.tab_pass, text=t('  密码生成  '))
+        nb.add(self.tab_pass, text=t('  加解密编码  '))
+        nb.add(self.tab_life, text=t('  生活  '))
 
         self._build_ping_tab()
         self._build_port_tab()
@@ -2294,8 +2986,9 @@ class UU889App:
         self._build_diag_tab()
         self._build_qmon_tab()
         self._build_arp_tab()
-        self._build_ipinfo_tab()
         self._build_pass_tab()
+        self._build_life_tab()
+        self._build_feature_index()
 
         foot = ttk.Label(root, foreground='#888',
                          text='⚠ 仅限对你拥有或已获授权的网络进行测试；大范围扫描可能触发对方安全告警。')
@@ -2309,8 +3002,25 @@ class UU889App:
             style.theme_use('clam')
         except Exception:
             pass
-        style.configure('Treeview', rowheight=22)
-        style.configure('Accent.TButton', font=('', 10, 'bold'))
+        try:
+            import tkinter.font as _tkfont
+            for _fn in ('TkDefaultFont', 'TkTextFont', 'TkFixedFont', 'TkMenuFont', 'TkHeadingFont', 'TkTooltipFont'):
+                try:
+                    _tkfont.nametofont(_fn).configure(size=11)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for _st in ('.', 'TButton', 'TLabel', 'TCheckbutton', 'TRadiobutton', 'TEntry',
+                    'TCombobox', 'TSpinbox', 'TNotebook.Tab', 'TLabelframe.Label'):
+            try:
+                style.configure(_st, font=('', 11))
+            except Exception:
+                pass
+        style.configure('Treeview', rowheight=28, font=('', 11))
+        style.configure('Treeview.Heading', font=('', 11, 'bold'))
+        style.configure('Accent.TButton', font=('', 11, 'bold'))
+        style.configure('TNotebook.Tab', font=('', 10), padding=(6, 3))
 
     # ---------- 公共控件 ----------
     def _make_tree(self, parent, columns, widths):
@@ -3230,12 +3940,17 @@ class UU889App:
 
         bar = ttk.Frame(f)
         bar.pack(fill='x', padx=10)
-        for txt, kind in (('DNS 解析', 'dns'), ('HTTP 检查', 'http'), ('TLS 证书', 'tls'),
-                          ('Ping 质量', 'quality'), ('MTU 探测', 'mtu'), ('IP归属地', 'ipinfo')):
-            b = ttk.Button(bar, text=txt, command=lambda k=kind: self._run_diag(k))
+        bar2 = ttk.Frame(f)
+        bar2.pack(fill='x', padx=10, pady=(4, 0))
+        _diag_btns = (('DNS(rDNS)解析', 'dns'), ('DNS查询', 'dnsq'), ('Whois', 'whois'),
+                      ('CIDR计算', 'cidr'), ('IP归属地', 'ipinfo'), ('HTTP 检查', 'http'),
+                      ('TLS 证书', 'tls'), ('Ping 质量', 'quality'), ('MTU 探测', 'mtu'))
+        for _i, (txt, kind) in enumerate(_diag_btns):
+            _p = bar if _i < 5 else bar2
+            b = ttk.Button(_p, text=txt, command=lambda k=kind: self._run_diag(k))
             b.pack(side='left', padx=(0, 6))
             self.start_buttons.append(b)
-        ttk.Button(bar, text=t('清空'),
+        ttk.Button(bar2, text=t('清空'),
                    command=lambda: self.diag_out.delete('1.0', 'end')).pack(side='left', padx=6)
 
         self.diag_status = ttk.Label(f, text='就绪（DNS/HTTP/TLS 需要联网）', foreground='#555')
@@ -3264,9 +3979,34 @@ class UU889App:
         try:
             if kind == 'dns':
                 r = dns_lookup(target)
-                text = '【DNS 解析】%s\n正向: %s\n反向: %s%s' % (
+                text = '【DNS(rDNS)解析】%s\n正向: %s\n反向: %s%s' % (
                     target, ', '.join(r['forward']) or '-', r['reverse'] or '-',
                     ('\n注: ' + r['error']) if r['error'] else '')
+            elif kind == 'dnsq':
+                if _is_ip(target) or '.' not in target:
+                    text = '【DNS 查询】“%s” 不是域名格式，请输入域名（如 example.com）再查 A/MX/CNAME/TXT 等记录。' % target
+                else:
+                    d = dns_query(target)
+                    lines = ['【DNS 查询】%s' % target]
+                    for qt in ('A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT'):
+                        for _tp, val in (d['records'].get(qt) or []):
+                            lines.append('  %-6s %s' % (qt, val))
+                    if d.get('error'):
+                        lines.append('  注: ' + d['error'])
+                    if len(lines) == 1:
+                        lines.append('  （未查到记录）')
+                    text = '\n'.join(lines)
+            elif kind == 'whois':
+                w = whois_query(target)
+                text = ('【Whois】%s ｜ 服务器: %s%s\n' % (
+                        w['target'], w.get('server', '-'),
+                        ('\n注: ' + w['error']) if w.get('error') else '')) + ('-' * 40) + '\n' + (w.get('text') or '（无返回）')
+            elif kind == 'cidr':
+                try:
+                    info = cidr_info(target)
+                    text = '【CIDR 计算】\n' + '\n'.join('%s: %s' % (k, v) for k, v in info.items())
+                except Exception as ce:
+                    text = '【CIDR 计算】输入无效：请填写形如 192.168.1.0/24 或 2001:db8::/48 的网段。(%s)' % ce
             elif kind == 'http':
                 r = http_check(target)
                 tls = ''
@@ -3605,77 +4345,211 @@ class UU889App:
         ttk.Button(top, text='关闭', command=on_close).pack(side='right', padx=6)
         win.protocol('WM_DELETE_WINDOW', on_close)
 
-    def _build_ipinfo_tab(self):
-        f = self.tab_ipinfo
+    def _build_feature_index(self):
+        life_alias = {
+            '个人所得税(月估算)': '个税 所得税 工资 iit',
+            '数字→人民币大写': '大写金额 金额大写 rmb 人民币',
+            '英文大小写转换': '大小写 uppercase lowercase',
+            '亲戚称谓计算': '称呼 辈分 亲属 关系',
+            '贷款计算器': '房贷 车贷 月供 按揭',
+            '存款利息': '利息 定期',
+            '世界时间': '时区 时差 timezone',
+            '长度换算(公制/英制)': '米 英尺 英寸 length',
+            '数字→人民币大写金额': '大写',
+        }
+        codec_alias = {
+            'MD5': '哈希 hash 摘要', 'SHA1': '哈希 hash', 'SHA256': '哈希 hash', 'SHA512': '哈希 hash',
+            '时间戳→日期': 'timestamp', '日期→时间戳': 'timestamp',
+            'Hex 十六进制': '16进制', 'JSON 格式化/压缩': '格式化',
+        }
+        idx = [
+            ('主机存活扫描', self.tab_ping, None, '主机存活扫描 ping ip段 存活'),
+            ('端口扫描', self.tab_port, None, '端口扫描 tcp udp syn 服务识别 banner 端口'),
+            ('路由追踪 + 地理定位', self.tab_trace, None, '路由追踪 traceroute 地理定位 离线地理库 世界地图'),
+            ('定时监控 + 变更告警', self.tab_monitor, None, '定时监控 变更告警 邮件 webhook 监控'),
+            ('网络诊断', self.tab_diag, None, '网络诊断 dns rdns dns查询 whois cidr http tls mtu ip归属地 ping质量'),
+            ('链路质量曲线', self.tab_qmon, None, '链路质量曲线 丢包 时延 抖动'),
+            ('ARP 监听', self.tab_arp, None, 'arp 监听 广播 mac 厂商'),
+            ('加解密编码', self.tab_pass, None, '加解密编码 密码生成 编码 加密'),
+            ('生活 工具箱', self.tab_life, None, '生活 工具箱 计算器 换算'),
+        ]
+        for _i, (_n, _tid, _d) in enumerate(CODEC_TOOLS):
+            dn = '加解密编码 · ' + _n
+            idx.append((dn, self.tab_pass, ('codec', _i), (dn + ' ' + codec_alias.get(_n, '')).lower()))
+        for _i, _d in enumerate(LIFE_TOOLS):
+            nm = _d['name']
+            dn = '生活 · ' + nm
+            idx.append((dn, self.tab_life, ('life', _i), (dn + ' ' + life_alias.get(nm, '')).lower()))
+        self._feat_index = idx
+        try:
+            self._feat_cb['values'] = [e[0] for e in idx]
+        except Exception:
+            pass
+
+    def _feat_filter(self, event=None):
+        if event is not None and getattr(event, 'keysym', '') in ('Return', 'Up', 'Down', 'Escape'):
+            return
+        q = self._feat_cb.get().strip().lower()
+        idx = getattr(self, '_feat_index', [])
+        self._feat_cb['values'] = ([e[0] for e in idx if q in e[3] or q in e[0].lower()] if q
+                                   else [e[0] for e in idx])
+
+    def _feat_go(self, event=None):
+        q = self._feat_cb.get().strip().lower()
+        if not q:
+            return
+        idx = getattr(self, '_feat_index', [])
+        hit = ([e for e in idx if q == e[0].lower()]
+               or [e for e in idx if q in e[3] or q in e[0].lower()])
+        if not hit:
+            return
+        name, frame, action, kw = hit[0]
+        try:
+            self.nb.select(frame)
+        except Exception:
+            pass
+        if action:
+            kind, i = action
+            try:
+                if kind == 'codec':
+                    self.codec_sel.current(i)
+                elif kind == 'life':
+                    self.life_sel.current(i)
+                    self._life_on_select()
+            except Exception:
+                pass
+
+    def _build_life_tab(self):
+        f = self.tab_life
         top = ttk.Frame(f)
         top.pack(fill='x', padx=10, pady=8)
-        ttk.Label(top, text='域名 / IP:').grid(row=0, column=0, sticky='w')
-        self.ipinfo_target = ttk.Entry(top, width=38)
-        self.ipinfo_target.insert(0, 'www.google.com')
-        self.ipinfo_target.grid(row=0, column=1, sticky='w', padx=6)
-        self.ipinfo_target.bind('<Return>', lambda e: self._ipinfo_query())
-        b = ttk.Button(top, text='查询归属地', style='Accent.TButton', command=self._ipinfo_query)
-        b.grid(row=0, column=2, padx=6)
-        self.start_buttons.append(b)
-        cols = ('IP', '类型', 'rDNS反查', '国家', '地区', '城市', 'ISP', '组织Org', 'AS')
-        ttk.Button(top, text='导出', command=lambda: self._export(self.ipinfo_tree, cols)).grid(row=0, column=3, padx=6)
-        self.ipinfo_status = ttk.Label(
-            f, foreground='#555',
-            text='输入域名或 IP：解析出全部 IPv4/IPv6，并显示 rDNS 反查、国家/地区/城市、ISP/组织/AS 等归属信息')
-        self.ipinfo_status.pack(fill='x', padx=10, pady=(0, 6))
-        wrap, self.ipinfo_tree = self._make_tree(
-            f, cols, (150, 55, 185, 70, 90, 90, 155, 150, 90))
-        wrap.pack(fill='both', expand=True, padx=10, pady=6)
+        ttk.Label(top, text='选择工具:').pack(side='left')
+        self.life_sel = ttk.Combobox(top, width=24, state='readonly',
+                                     values=[d['name'] for d in LIFE_TOOLS])
+        self.life_sel.current(0)
+        self.life_sel.pack(side='left', padx=6)
+        self.life_sel.bind('<<ComboboxSelected>>', self._life_on_select)
+        ttk.Button(top, text='计算', style='Accent.TButton', command=self._life_go).pack(side='left', padx=6)
+        self.life_form = ttk.Frame(f)
+        self.life_form.pack(fill='x', padx=12, pady=8)
+        self.life_entries = []
+        self.life_out = tk.Text(f, height=12, wrap='word')
+        self.life_out.pack(fill='both', expand=True, padx=10, pady=6)
+        self._life_on_select()
 
-    def _ipinfo_query(self):
-        target = self.ipinfo_target.get().strip()
-        if not target:
-            return
-        self._clear(self.ipinfo_tree)
-        self.ipinfo_status.configure(text='正在查询 %s ...' % target)
-        threading.Thread(target=self._ipinfo_worker, args=(target,), daemon=True).start()
+    def _life_on_select(self, event=None):
+        for w in self.life_form.winfo_children():
+            w.destroy()
+        self.life_entries = []
+        d = LIFE_TOOLS[self.life_sel.current()]
+        for i, (label, default) in enumerate(d['fields']):
+            ttk.Label(self.life_form, text=label + ':').grid(row=i, column=0, sticky='e', padx=4, pady=3)
+            e = ttk.Entry(self.life_form, width=32)
+            e.insert(0, default)
+            e.grid(row=i, column=1, sticky='w', padx=4, pady=3)
+            e.bind('<Return>', lambda ev: self._life_go())
+            self.life_entries.append(e)
 
-    def _ipinfo_worker(self, target):
+    def _life_go(self):
+        d = LIFE_TOOLS[self.life_sel.current()]
+        vals = [e.get() for e in self.life_entries]
         try:
-            info = ip_info(target)
-        except Exception as e:
-            info = {'query': target, 'records': [], 'error': '%s: %s' % (e.__class__.__name__, e)}
-        self.q.put({'tab': 'ipinfo', 'type': 'result', 'info': info})
+            res = d['run'](vals)
+        except Exception as ex:
+            res = '输入有误：%s' % ex
+        self.life_out.delete('1.0', 'end')
+        self.life_out.insert('1.0', '【%s】\n%s' % (d['name'], res))
+
+    def _codec_go(self, mode):
+        tid = self._codec_ids[self.codec_sel.current()]
+        text = self.codec_in.get('1.0', 'end').rstrip('\n')
+        try:
+            out = codec_run(tid, text, mode)
+        except Exception as ex:
+            out = '出错：%s' % ex
+        self.codec_out.delete('1.0', 'end')
+        self.codec_out.insert('1.0', out)
+
+    def _baseconv_go(self):
+        try:
+            out = base_convert(self.base_val.get(), int(self.base_from.get()), int(self.base_to.get()))
+        except Exception as ex:
+            out = '出错：%s' % ex
+        self.base_res.configure(text='结果: ' + out)
 
     def _build_pass_tab(self):
         f = self.tab_pass
-        top = ttk.Frame(f)
-        top.pack(fill='x', padx=10, pady=8)
-        ttk.Label(top, text='长度:').grid(row=0, column=0, sticky='e')
-        self.pw_len = ttk.Spinbox(top, from_=4, to=128, width=6)
+        pg = ttk.LabelFrame(f, text='密码生成')
+        pg.pack(fill='x', padx=10, pady=(8, 4))
+        row = ttk.Frame(pg)
+        row.pack(fill='x', padx=6, pady=4)
+        ttk.Label(row, text='长度:').pack(side='left')
+        self.pw_len = ttk.Spinbox(row, from_=4, to=128, width=5)
         self.pw_len.set(16)
-        self.pw_len.grid(row=0, column=1, sticky='w', padx=6)
-        ttk.Label(top, text='数量:').grid(row=0, column=2, sticky='e')
-        self.pw_count = ttk.Spinbox(top, from_=1, to=200, width=6)
+        self.pw_len.pack(side='left', padx=(2, 10))
+        ttk.Label(row, text='数量:').pack(side='left')
+        self.pw_count = ttk.Spinbox(row, from_=1, to=200, width=5)
         self.pw_count.set(5)
-        self.pw_count.grid(row=0, column=3, sticky='w', padx=6)
-
-        opt = ttk.Frame(f)
-        opt.pack(fill='x', padx=10)
+        self.pw_count.pack(side='left', padx=(2, 10))
         self.pw_upper = tk.BooleanVar(value=True)
         self.pw_lower = tk.BooleanVar(value=True)
         self.pw_digits = tk.BooleanVar(value=True)
         self.pw_symbols = tk.BooleanVar(value=True)
         self.pw_amb = tk.BooleanVar(value=False)
-        for label, var in (('大写 A-Z', self.pw_upper), ('小写 a-z', self.pw_lower),
-                           ('数字 0-9', self.pw_digits), ('符号 !@#', self.pw_symbols),
-                           ('避免易混(0O1lI)', self.pw_amb)):
-            ttk.Checkbutton(opt, text=label, variable=var).pack(side='left', padx=(0, 10))
+        for label, var in (('大写', self.pw_upper), ('小写', self.pw_lower),
+                           ('数字', self.pw_digits), ('符号', self.pw_symbols),
+                           ('避免易混', self.pw_amb)):
+            ttk.Checkbutton(row, text=label, variable=var).pack(side='left', padx=(0, 6))
+        ttk.Button(row, text='生成', command=self._gen_pw).pack(side='left', padx=(6, 4))
+        ttk.Button(row, text='复制', command=self._copy_pw).pack(side='left')
+        self.pw_strength = ttk.Label(pg, text='用密码学安全随机数 (secrets) 生成', foreground='#555')
+        self.pw_strength.pack(anchor='w', padx=8)
+        self.pw_out = tk.Text(pg, height=4)
+        self.pw_out.pack(fill='x', padx=8, pady=(2, 6))
+        cf = ttk.LabelFrame(f, text='编码 / 加解密')
+        cf.pack(fill='both', expand=True, padx=10, pady=4)
+        crow = ttk.Frame(cf)
+        crow.pack(fill='x', padx=6, pady=4)
+        ttk.Label(crow, text='工具:').pack(side='left')
+        self._codec_ids = [tid for _n, tid, _d in CODEC_TOOLS]
+        self.codec_sel = ttk.Combobox(crow, width=20, state='readonly',
+                                      values=[n for n, _t, _d in CODEC_TOOLS])
+        self.codec_sel.current(0)
+        self.codec_sel.pack(side='left', padx=6)
+        ttk.Button(crow, text='编码/加密/计算', command=lambda: self._codec_go('enc')).pack(side='left', padx=4)
+        ttk.Button(crow, text='解码', command=lambda: self._codec_go('dec')).pack(side='left')
+        ttk.Button(crow, text='清空',
+                   command=lambda: (self.codec_in.delete('1.0', 'end'), self.codec_out.delete('1.0', 'end'))).pack(side='left', padx=4)
+        io = ttk.Frame(cf)
+        io.pack(fill='both', expand=True, padx=6, pady=4)
+        ttk.Label(io, text='输入:').grid(row=0, column=0, sticky='w')
+        ttk.Label(io, text='输出:').grid(row=0, column=1, sticky='w')
+        self.codec_in = tk.Text(io, height=6, width=40, wrap='word')
+        self.codec_out = tk.Text(io, height=6, width=40, wrap='word')
+        self.codec_in.grid(row=1, column=0, sticky='nsew', padx=(0, 4))
+        self.codec_out.grid(row=1, column=1, sticky='nsew', padx=(4, 0))
+        io.columnconfigure(0, weight=1)
+        io.columnconfigure(1, weight=1)
+        io.rowconfigure(1, weight=1)
+        self.codec_in.insert('1.0', 'Hello 你好 NetProbe')
+        bf = ttk.Frame(cf)
+        bf.pack(fill='x', padx=6, pady=(2, 6))
+        ttk.Label(bf, text='进制转换  值:').pack(side='left')
+        self.base_val = ttk.Entry(bf, width=18)
+        self.base_val.insert(0, '255')
+        self.base_val.pack(side='left', padx=4)
+        ttk.Label(bf, text='从').pack(side='left')
+        self.base_from = ttk.Combobox(bf, width=4, state='readonly', values=['2', '8', '10', '16'])
+        self.base_from.set('10')
+        self.base_from.pack(side='left', padx=2)
+        ttk.Label(bf, text='到').pack(side='left')
+        self.base_to = ttk.Combobox(bf, width=4, state='readonly', values=['2', '8', '10', '16'])
+        self.base_to.set('16')
+        self.base_to.pack(side='left', padx=2)
+        ttk.Button(bf, text='转换', command=self._baseconv_go).pack(side='left', padx=4)
+        self.base_res = ttk.Label(bf, text='结果:', foreground='#137333')
+        self.base_res.pack(side='left', padx=6)
 
-        bar = ttk.Frame(f)
-        bar.pack(fill='x', padx=10, pady=(6, 0))
-        ttk.Button(bar, text='生成', style='Accent.TButton', command=self._gen_pw).pack(side='left')
-        ttk.Button(bar, text='复制全部', command=self._copy_pw).pack(side='left', padx=6)
-        ttk.Button(bar, text='清空', command=lambda: self.pw_out.delete('1.0', 'end')).pack(side='left')
-        self.pw_strength = ttk.Label(f, text='用密码学安全随机数 (secrets) 生成', foreground='#555')
-        self.pw_strength.pack(fill='x', padx=10, pady=6)
-        self.pw_out = tk.Text(f, height=14)
-        self.pw_out.pack(fill='both', expand=True, padx=10, pady=6)
 
     def _gen_pw(self):
         try:
@@ -3839,20 +4713,6 @@ class UU889App:
                 self.arp_status.configure(text=m['text'])
             elif typ == 'done':
                 self._set_scanning(False)
-        elif tab == 'ipinfo':
-            if typ == 'result':
-                info = m['info']
-                if info.get('error'):
-                    self.ipinfo_status.configure(text='查询失败：' + info['error'])
-                    return
-                recs = info.get('records', [])
-                for r in recs:
-                    self.ipinfo_tree.insert('', 'end', values=(
-                        r['ip'], r.get('family', ''), r.get('rdns', ''), r.get('country', ''),
-                        r.get('region', ''), r.get('city', ''), r.get('isp', ''),
-                        r.get('org', ''), r.get('asn', '')))
-                self.ipinfo_status.configure(
-                    text='%s → 共 %d 个 IP（IPv4/IPv6）' % (info.get('query', ''), len(recs)))
 
 
 def main():

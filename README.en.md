@@ -61,11 +61,12 @@ Host discovery · Port scanning · Traceroute with geolocation · Scheduled moni
 | **Port Scan** | TCP connect scan + UDP protocol probes; service detection, banner grabbing, **high-risk ports highlighted**; a high-speed `selectors` engine; **raw-socket SYN half-open** when run as root (auto-falls back without it) |
 | **Traceroute + Geo** | Per-hop traceroute annotated with country/region/city and ISP/Org/AS; a **Leaflet world map** visualization; geo source can be **online or a one-click offline database** |
 | **Monitoring + Alerts** | Periodically scan host liveness / port state and alert on change; multi-line targets with mixed `host:port`; **email / webhooks (Slack, Discord, DingTalk, WeCom, Feishu)**; SQLite storage, HTML report + trend chart, PDF export, multi-device dashboard |
-| **Diagnostics** | DNS forward/reverse, HTTP(S) check, TLS certificate check, ping quality (loss/jitter), path MTU, IP info; full **IPv6** support |
+| **Diagnostics** | **DNS(rDNS) resolve**, **DNS record query (A/MX/CNAME/TXT/NS)**, **Whois (domain / IP registration)**, **CIDR calculator**, HTTP(S) check, TLS certificate, ping quality, path MTU, **IP info**; full **IPv6** support |
 | **Link-Quality Curve** | Continuously measure a target and plot a loss/latency curve (inline SVG, viewable offline) |
 | **ARP Monitor** | Read/actively populate the local ARP neighbor table (IP↔MAC + vendor lookup); continuous monitoring detects **new devices / MAC changes (possible ARP spoofing)**; **double-click an IP to listen to its broadcast/multicast traffic** (NetBIOS/mDNS/SSDP/LLMNR/DHCP…) |
-| **IP Info** | Domain → all IPv4+IPv6 addresses, reverse DNS, country/region/city, ISP/Org/AS; tabular, exportable |
-| **Password Generator** | Cryptographically secure randomness via `secrets`, configurable length/charset, with a strength estimate |
+| **Encode / Crypto** | Password generator (`secrets` secure random) + Base64/Base64URL/URL/Hex/HTML/Unicode encode-decode, MD5/SHA1/SHA256/SHA512, JSON format, timestamp convert, base convert, Morse, ROT13 |
+| **Life Toolkit** | Unit conversions (length incl. metric/imperial, area, volume, mass, temperature, speed, power, pressure, energy, density), geometry solids, income tax, loan, deposit, date math, number→Chinese capital, zodiac/Chinese-zodiac/blood-type inheritance, paper sizes, world time, **offline kinship-term calculator** |
+| **🔍 Feature Search** | Top-bar search box — type a keyword to instantly locate and jump to any feature or tool tab |
 | **HTTP API / Web Panel** | The `serve` subcommand runs a resident JSON API + a simple web panel for integration |
 
 ---
@@ -81,10 +82,10 @@ Host discovery · Port scanning · Traceroute with geolocation · Scheduled moni
 | ![Traceroute](docs/tracert_geo.jpg) | ![Monitoring](docs/monitor_changing_alerts.jpg) |
 | **Diagnostics** | **Link-Quality Curve** |
 | ![Diagnostics](docs/network_test.jpg) | ![Link Quality](docs/link_test.jpg) |
-| **ARP Monitor** | **IP Info** |
+| **ARP Monitor** | **IP Info (in Diagnostics)** |
 | ![ARP Monitor](docs/arp.jpg) | ![IP Info](docs/ip_geo.jpg) |
-| **Password Generator** | |
-| ![Password Generator](docs/password.jpg) | |
+| **Encode / Crypto** | |
+| ![Encode / Crypto](docs/password.jpg) | |
 
 </div>
 
@@ -119,7 +120,7 @@ The app opens a tabbed window; the top bar switches the **UI language** and open
 
 ```
 Host Discovery │ Port Scan │ Traceroute + Geo │ Monitoring + Alerts │ Diagnostics
-Link Quality │ ARP Monitor │ IP Info │ Password Generator
+Link Quality │ ARP Monitor │ Encode / Crypto │ Life
 ```
 
 - **Port Scan** — "show open only / grab banner / fast mode / service detection" are on by default; open high-risk ports (RDP/SMB/Redis/databases/Docker API, etc.) are highlighted with a risk note.
